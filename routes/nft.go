@@ -36,6 +36,10 @@ type NFTEntryResponse struct {
 
 	// ExtraData is an arbitrary key value map
 	ExtraData map[string]string `safeForLogging:"true"`
+
+	// Transfer NFT fields
+	IsNonTransferable bool `safeForLogging:"true"`
+    HasBeenTransferred bool `safeForLogging:"true"`
 }
 
 type NFTCollectionResponse struct {
@@ -80,6 +84,7 @@ type CreateNFTRequest struct {
 	IsForSale                      bool              `safeForLogging:"true"`
 	MinBidAmountNanos              int               `safeForLogging:"true"`
 	IsBuyNow                       bool              `safeForLogging:"true"`
+	IsNonTransferable			   bool 			 `safeForLogging:"true"`
 	BuyNowPriceNanos               uint64            `safeForLogging:"true"`
 	AdditionalDESORoyaltiesMap     map[string]uint64 `safeForLogging:"true"`
 	AdditionalCoinRoyaltiesMap     map[string]uint64 `safeForLogging:"true"`
@@ -251,6 +256,18 @@ func (fes *APIServer) CreateNFT(ww http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	nftEntry := &NFTEntryResponse{
+        OwnerPublicKeyBase58Check: requestData.UpdaterPublicKeyBase58Check,
+        SerialNumber:              uint64(requestData.NumCopies),
+        IsForSale:                 requestData.IsForSale,
+        IsBuyNow:                  requestData.IsBuyNow,
+        BuyNowPriceNanos:          requestData.BuyNowPriceNanos,
+        MinBidAmountNanos:         uint64(requestData.MinBidAmountNanos),
+        IsNonTransferable:         requestData.IsNonTransferable,
+        HasBeenTransferred:        false, // Initially, the NFT has not been transferred
+        ExtraData:                 requestData.ExtraData,
+    }
+
 	// Try and create the create NFT txn for the user.
 	txn, totalInput, changeAmount, fees, err := fes.blockchain.CreateCreateNFTTxn(
 		updaterPublicKeyBytes,
@@ -282,6 +299,10 @@ func (fes *APIServer) CreateNFT(ww http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	nftID := fmt.Sprintf("%s-%d", requestData.NFTPostHashHex, requestData.NumCopies)
+    transferManager := GetNFTTransferManager()
+    transferManager.SetTransferStatus(nftID, requestData.IsNonTransferable)
+
 	// Return all the data associated with the transaction in the response
 	res := CreateNFTResponse{
 		NFTPostHashHex:    requestData.NFTPostHashHex,
@@ -305,6 +326,7 @@ type UpdateNFTRequest struct {
 	IsForSale                   bool   `safeForLogging:"true"`
 	MinBidAmountNanos           int    `safeForLogging:"true"`
 	IsBuyNow                    bool   `safeForLogging:"true"`
+	IsNonTransferable			bool   `safeForLogging:"true"`
 	BuyNowPriceNanos            uint64 `safeForLogging:"true"`
 
 	MinFeeRateNanosPerKB uint64 `safeForLogging:"true"`
@@ -331,6 +353,11 @@ func (fes *APIServer) UpdateNFT(ww http.ResponseWriter, req *http.Request) {
 	requestData := UpdateNFTRequest{}
 	if err := decoder.Decode(&requestData); err != nil {
 		_AddBadRequestError(ww, fmt.Sprintf("UpdateNFT: Error parsing request body: %v", err))
+		return
+	}
+
+	if requestData.IsNonTransferable {
+		_AddBadRequestError(ww, fmt.Sprintf("UpdateNFT: Non-transferable NFTs cannot be updated"))
 		return
 	}
 
@@ -493,6 +520,17 @@ func (fes *APIServer) CreateNFTBid(ww http.ResponseWriter, req *http.Request) {
 		fes.backendServer.GetMempool(),
 		requestData.OptionalPrecedingTransactions,
 	)
+
+	nftEntry := utxoView.GetNFTEntryForNFTKey(&lib.NFTKey{
+		NFTPostHash:  lib.MustDecodeHex(requestData.NFTPostHashHex),
+		SerialNumber: uint64(requestData.SerialNumber),
+	})
+
+	if nftEntry.IsNonTransferable {
+		_AddBadRequestError(ww, "CreateNFTBid: This NFT is non-transferable and cannot be bid on.")
+		return
+	}
+
 	if err != nil {
 		_AddBadRequestError(ww, fmt.Sprintf("CreateNFTBid: Error getting utxoView: %v", err))
 		return
@@ -1546,6 +1584,7 @@ type TransferNFTRequest struct {
 	NFTPostHashHex               string `safeForLogging:"true"`
 	SerialNumber                 int    `safeForLogging:"true"`
 	EncryptedUnlockableText      string `safeForLogging:"true"`
+	hasBeenTransfered			bool   `safeForLogging:"true"`
 
 	MinFeeRateNanosPerKB uint64 `safeForLogging:"true"`
 
@@ -1617,6 +1656,15 @@ func (fes *APIServer) TransferNFT(ww http.ResponseWriter, req *http.Request) {
 	nftPostHash := &lib.BlockHash{}
 	copy(nftPostHash[:], nftPostHashBytes)
 
+	    // Get the NFT entry
+		nftEntry := utxoView.GetNFTEntryForNFTKey(&nftKey)
+
+		// Check if the NFT has been transferred before
+		if nftEntry.IsNonTransferable && nftEntry.HasBeenTransferred {
+			_AddBadRequestError(ww, "TransferNFT: This NFT is non-transferable and has already been transferred.")
+			return
+		}
+
 	// Get the sender's public key.
 	senderPublicKeyBytes, _, err := lib.Base58CheckDecode(requestData.SenderPublicKeyBase58Check)
 	if err != nil {
@@ -1666,6 +1714,15 @@ func (fes *APIServer) TransferNFT(ww http.ResponseWriter, req *http.Request) {
 			"TransferNFT: post entry has an unlockable. Must include encrypted unlockable text."))
 		return
 	}
+
+	nftID := fmt.Sprintf("%s-%d", requestData.NFTPostHashHex, requestData.SerialNumber)
+    transferManager := GetNFTTransferManager()
+    if transferManager.GetTransferStatus(nftID) {
+        _AddBadRequestError(ww, "TransferNFT: This NFT is non-transferable and cannot be transferred.")
+        return
+    }
+
+	transferManager.SetTransferStatus(nftID, true)
 
 	// Try and create the NFT transfer txn for the user.
 	txn, totalInput, changeAmount, fees, err := fes.blockchain.CreateNFTTransferTxn(
@@ -2225,4 +2282,28 @@ func (fes *APIServer) GetAcceptedBidHistory(ww http.ResponseWriter, req *http.Re
 		_AddInternalServerError(ww, fmt.Sprintf("GetAcceptedBidHistory: Problem serializing object to JSON: %v", err))
 		return
 	}
+}
+
+type NFTTransferManager struct {
+    nftTransferStatus map[string]bool
+}
+
+var instance *NFTTransferManager
+var once sync.Once
+
+func GetNFTTransferManager() *NFTTransferManager {
+    once.Do(func() {
+        instance = &NFTTransferManager{
+            nftTransferStatus: make(map[string]bool),
+        }
+    })
+    return instance
+}
+
+func (manager *NFTTransferManager) SetTransferStatus(nftID string, status bool) {
+    manager.nftTransferStatus[nftID] = status
+}
+
+func (manager *NFTTransferManager) GetTransferStatus(nftID string) bool {
+    return manager.nftTransferStatus[nftID]
 }
